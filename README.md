@@ -1,3 +1,112 @@
 # Deep Inverse Regression on Linear Quotient Spaces
 
+## Pipeline 1: Estimate the nuisance subspace
+
+`ResidualBatchPCA.py` estimates the
+nuisance subspace using the training batches only. Validation and test
+data must not be passed to `estimator.fit()`.
+
+```python
+# Y_train: (n_train, 128)
+# gas_train: gas identity
+# concentration_train: concentration
+# batch_train: training-batch labels
+
+estimator = ResidualBatchPCA(
+    rank=None,
+    variance_threshold=0.90,
+    ridge_alpha=1.0,
+    n_knots=5,
+    spline_degree=3,
+)
+
+estimator.fit(
+    Y=Y_train,
+    gas=gas_train,
+    concentration=concentration_train,
+    batch=batch_train,
+)
+
+A_hat = estimator.A_hat_
+P_hat = estimator.P_hat_
+
+print(estimator.diagnostics())
+```
+
+Here, `A_hat` contains the estimated nuisance directions and
+
+$$
+P_{\mathrm{hat}}=I-A_{\mathrm{hat}}A_{\mathrm{hat}}^\top
+$$
+
+is the quotient projection. The 90% explained-variance rule provides a
+candidate nuisance rank; the final deployment decision is made by the
+proposed discriminator.
+
+## Pipeline 2: Generate raw and quotient representations
+
+Both branches use the same scaler fitted on the training data.
+
+```python
+# Raw standardized representations
+Y_train_raw = estimator.scaler_.transform(Y_train)
+Y_valid_raw = estimator.scaler_.transform(Y_valid)
+Y_test_raw = estimator.scaler_.transform(Y_test)
+
+# Quotient representations
+Y_train_quotient = estimator.transform(Y_train)
+Y_valid_quotient = estimator.transform(Y_valid)
+Y_test_quotient = estimator.transform(Y_test)
+```
+
+Gas identity, concentration, and batch labels are required only when
+estimating `A_hat`. They are not required by `estimator.transform()` at
+inference time.
+
+## Pipeline 3: Train the backbones
+
+The raw and quotient models must use identical architectures, training
+settings, validation procedures, and hyperparameter-search budgets.
+
+```python
+raw_model = build_backbone(model_config)
+quotient_model = build_backbone(model_config)
+
+raw_model.fit(
+    Y_train_raw,
+    q_train,
+    validation_data=(Y_valid_raw, q_valid),
+)
+
+quotient_model.fit(
+    Y_train_quotient,
+    q_train,
+    validation_data=(Y_valid_quotient, q_valid),
+)
+```
+
+If the inverse model also uses known experimental information `x`, pass
+the same `x` to both branches:
+
+```python
+raw_model.fit(
+    [Y_train_raw, x_train],
+    q_train,
+    validation_data=([Y_valid_raw, x_valid], q_valid),
+)
+
+quotient_model.fit(
+    [Y_train_quotient, x_train],
+    q_train,
+    validation_data=([Y_valid_quotient, x_valid], q_valid),
+)
+```
+
+All preprocessing and model choices are fixed using the training and
+validation sets. The isolated test batches are evaluated only once at
+the end.
+
+
+
+
 ## Inverse Task 1. UCI Gas Sensor Dataset
