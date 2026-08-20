@@ -110,7 +110,7 @@ the end.
 一、基本设定
 数据集：UCI Gas Sensor Array Drift Dataset
 来源：加州大学尔湾分校气体传感器阵列漂移数据集
-13,910条记录、10个时间批次、6种气体、16个化学传感器。维度为6*16=96。
+13,910条记录、10个时间批次、6种气体、16个化学传感器，提取特征维度为8。总维度为8*16=128。
 
 Backbone：
 1. ResNet-Based MLP (可以查一下Kaiming He的ResNet)
