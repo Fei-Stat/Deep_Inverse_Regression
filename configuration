@@ -1,0 +1,159 @@
+# ============================================
+# scripts/config.py
+# Four publication-grade tabular backbones
+# ============================================
+
+from dataclasses import dataclass
+import torch
+
+
+def get_device() -> str:
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+DEVICE = get_device()
+
+SEEDS = [42, 123, 456, 789, 1024]
+NUM_CLASSES = 6
+INPUT_DIM = 128
+
+
+# ------------------------------------------------------------
+# Generic training config
+# ------------------------------------------------------------
+@dataclass
+class TrainingConfig:
+    batch_size: int = 256
+    epochs: int = 200
+    patience: int = 20
+
+    # Used as fallbacks. FT-Transformer and TabM have their own
+    # optimizer settings below.
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+
+    criterion: str = "cross_entropy"
+    eval_metric: str = "accuracy"
+
+
+# ------------------------------------------------------------
+# 1. Yandex/RTDL ResNet for tabular data
+#
+# Official structure:
+# Linear -> residual blocks -> BatchNorm -> ReLU -> Linear
+# ------------------------------------------------------------
+@dataclass
+class ResNetMLPConfig:
+    input_dim: int = INPUT_DIM
+    num_classes: int = NUM_CLASSES
+
+    n_blocks: int = 3
+    d_block: int = 192
+    d_hidden_multiplier: float = 2.0
+
+    dropout1: float = 0.15
+    dropout2: float = 0.0
+
+    lr: float = 1e-3
+    weight_decay: float = 1e-5
+
+
+# ------------------------------------------------------------
+# 2. Yandex/RTDL FT-Transformer
+#
+# Every scalar numerical feature gets its OWN token.
+# With INPUT_DIM=128, the Transformer sees 128 feature tokens
+# plus its CLS token, instead of sequence length 1.
+# ------------------------------------------------------------
+@dataclass
+class FTTransformerConfig:
+    input_dim: int = INPUT_DIM
+    num_classes: int = NUM_CLASSES
+
+    n_blocks: int = 3
+    d_block: int = 192
+    n_heads: int = 8
+
+    attention_dropout: float = 0.2
+    ffn_d_hidden_multiplier: float = 4.0 / 3.0
+    ffn_dropout: float = 0.1
+    residual_dropout: float = 0.0
+
+    lr: float = 1e-4
+    weight_decay: float = 1e-5
+
+
+# ------------------------------------------------------------
+# 3. Official Yandex TabM
+# ------------------------------------------------------------
+@dataclass
+class TabMConfig:
+    input_dim: int = INPUT_DIM
+    num_classes: int = NUM_CLASSES
+
+    # Standard ensemble size used by the official TabM package/paper.
+    k: int = 32
+
+    arch_type: str = "tabm"
+    n_blocks: int = 3
+    d_block: int = 512
+    dropout: float = 0.1
+
+    # Current official default optimizer for default TabM.
+    lr: float = 2e-3
+    weight_decay: float = 3e-4
+
+    # Backward-compatible aliases for the student's old code.
+    @property
+    def n_views(self) -> int:
+        return self.k
+
+    @property
+    def hidden_dims(self):
+        return [self.d_block] * self.n_blocks
+
+
+# ------------------------------------------------------------
+# 4. XGBoost multiclass classifier
+# ------------------------------------------------------------
+@dataclass
+class XGBoostConfig:
+    num_classes: int = NUM_CLASSES
+
+    # Give early stopping enough room; best_iteration will usually be
+    # much smaller than n_estimators.
+    n_estimators: int = 2000
+    max_depth: int = 6
+    learning_rate: float = 0.05
+
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+
+    min_child_weight: float = 1.0
+    reg_lambda: float = 1.0
+    reg_alpha: float = 0.0
+
+    tree_method: str = "hist"
+
+    # Keep CPU as the safe default. Set to "cuda" only when the installed
+    # XGBoost build has CUDA support.
+    device: str = "cpu"
+
+    eval_metric: str = "mlogloss"
+    early_stopping_rounds: int = 50
+    n_jobs: int = -1
+
+
+train_config = TrainingConfig()
+resnet_config = ResNetMLPConfig()
+ft_config = FTTransformerConfig()
+tabm_config = TabMConfig()
+xgb_config = XGBoostConfig()
+
+
+if __name__ == "__main__":
+    print("DEVICE:", DEVICE)
+    print("ResNet:", resnet_config)
+    print("FT-Transformer:", ft_config)
+    print("TabM:", tabm_config)
+    print("XGBoost:", xgb_config)
