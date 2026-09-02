@@ -1,729 +1,1052 @@
 from __future__ import annotations
 
-import argparse
-import csv
+from dataclasses import dataclass
 from pathlib import Path
-import warnings
 
 import numpy as np
-import torch
-from torch.utils.data import (
-    DataLoader,
-    TensorDataset,
-)
+import pandas as pd
 
-from datasets.fd004 import (
-    load_fd004,
-    read_engine_ids_file,
-    build_fd004_forward_design,
-    append_standardized_settings,
-    describe_fd004,
-)
-
-from scripts.ResidualBatchPCA import (
-    ResidualBatchPCA,
-)
-
-from scripts.config import (
-    DEVICE,
-    SEEDS,
-    train_config,
-    configs_for_dataset,
-)
-
-from scripts.training_utils import (
-    set_seed,
-    build_torch_model,
-    fit_torch_regressor,
-    evaluate_torch,
-    train_xgboost,
-    evaluate_xgboost,
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import (
+    SplineTransformer,
+    StandardScaler,
 )
 
 
-BACKBONES = [
-    "resnet",
-    "ft_transformer",
-    "tabm",
-    "xgboost",
+FD004_COLUMNS = (
+    [
+        "engine_id",
+        "cycle",
+        "setting_1",
+        "setting_2",
+        "setting_3",
+    ]
+    + [
+        f"sensor_{j}"
+        for j in range(1, 22)
+    ]
+)
+
+SETTING_COLUMNS = [
+    "setting_1",
+    "setting_2",
+    "setting_3",
 ]
 
-PAPER_WINDOW_COUNTS = {
-    "train_windows": 23034,
-    "valid_windows": 5417,
-    "test_windows": 18429,
-}
+SENSOR_COLUMNS = [
+    f"sensor_{j}"
+    for j in range(1, 22)
+]
 
 
-def make_loader(
-    X,
-    y,
-    batch_size,
-    shuffle,
-):
-    dataset = TensorDataset(
-        torch.as_tensor(
-            X,
-            dtype=torch.float32,
-        ),
-        torch.as_tensor(
-            y,
-            dtype=torch.float32,
-        ),
-    )
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=0,
-        pin_memory=(
-            torch.cuda.is_available()
-        ),
-    )
+@dataclass
+class FD004Partition:
+    Y: np.ndarray
+    q: np.ndarray
+    settings: np.ndarray
+    engine_id: np.ndarray
+    cycle: np.ndarray
 
 
-def endpoint_mask(
-    engine_id,
-    cycle,
-):
-    engine_id = np.asarray(
-        engine_id
-    )
+@dataclass
+class FD004Data:
+    train: FD004Partition
+    valid: FD004Partition
+    test: FD004Partition
+    train_engine_ids: np.ndarray
+    valid_engine_ids: np.ndarray
 
-    cycle = np.asarray(
-        cycle
-    )
 
-    mask = np.zeros(
-        len(engine_id),
-        dtype=bool,
-    )
+class FD004ForwardDesign:
+    """
+    Training-only forward design for E[Y | RUL, settings].
 
-    for engine in np.unique(
-        engine_id
+    Columns:
+        intercept
+        spline(capped RUL)
+        standardized operating settings
+        six operating-regime indicators
+        spline(RUL) x regime interactions
+    """
+
+    def __init__(
+        self,
+        n_regimes=6,
+        n_knots=5,
+        spline_degree=3,
+        random_state=42,
     ):
-        idx = np.flatnonzero(
-            engine_id == engine
+        self.n_regimes = int(n_regimes)
+        self.n_knots = int(n_knots)
+        self.spline_degree = int(
+            spline_degree
+        )
+        self.random_state = int(
+            random_state
         )
 
-        last = idx[
-            np.argmax(
-                cycle[idx]
+    def fit(
+        self,
+        q,
+        settings,
+    ):
+        q = np.asarray(
+            q,
+            dtype=float,
+        ).reshape(-1, 1)
+
+        settings = np.asarray(
+            settings,
+            dtype=float,
+        )
+
+        if (
+            settings.ndim != 2
+            or settings.shape[1] != 3
+        ):
+            raise ValueError(
+                "settings must have shape (n, 3)."
             )
-        ]
 
-        mask[last] = True
+        self.setting_scaler_ = (
+            StandardScaler()
+        )
 
-    return mask
+        settings_z = (
+            self.setting_scaler_
+            .fit_transform(settings)
+        )
 
+        self.rul_spline_ = (
+            SplineTransformer(
+                n_knots=self.n_knots,
+                degree=self.spline_degree,
+                include_bias=False,
+            )
+        )
 
-def parse_list_or_all(
-    value,
-    allowed,
-    cast=str,
-):
-    if str(value).lower() == "all":
-        return list(allowed)
+        self.rul_spline_.fit(q)
 
-    return [
-        cast(item.strip())
-        for item
-        in str(value).split(",")
-        if item.strip()
-    ]
+        self.regime_model_ = KMeans(
+            n_clusters=self.n_regimes,
+            n_init=20,
+            random_state=self.random_state,
+        )
 
+        self.regime_model_.fit(
+            settings_z
+        )
 
-def save_row(
-    path,
-    row,
-):
-    path = Path(path)
+        return self
 
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    def transform(
+        self,
+        q,
+        settings,
+    ):
+        if not hasattr(
+            self,
+            "setting_scaler_",
+        ):
+            raise RuntimeError(
+                "Call fit() first."
+            )
 
-    write_header = (
-        not path.exists()
-    )
+        q = np.asarray(
+            q,
+            dtype=float,
+        ).reshape(-1, 1)
 
-    with path.open(
-        "a",
-        newline="",
-        encoding="utf-8",
-    ) as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=list(
-                row.keys()
+        settings = np.asarray(
+            settings,
+            dtype=float,
+        )
+
+        settings_z = (
+            self.setting_scaler_
+            .transform(settings)
+        )
+
+        spline = (
+            self.rul_spline_
+            .transform(q)
+        )
+
+        regime = (
+            self.regime_model_
+            .predict(settings_z)
+        )
+
+        one_hot = np.zeros(
+            (
+                len(regime),
+                self.n_regimes,
             ),
+            dtype=float,
         )
 
-        if write_header:
-            writer.writeheader()
+        one_hot[
+            np.arange(len(regime)),
+            regime,
+        ] = 1.0
 
-        writer.writerow(
-            row
+        interaction = (
+            one_hot[:, :, None]
+            * spline[:, None, :]
+        ).reshape(
+            len(regime),
+            -1,
         )
 
-
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "C-MAPSS FD004 raw-versus-quotient RUL regression."
+        return np.column_stack(
+            [
+                np.ones(
+                    len(q),
+                    dtype=float,
+                ),
+                spline,
+                settings_z,
+                one_hot,
+                interaction,
+            ]
         )
-    )
 
-    parser.add_argument(
-        "--data-dir",
-        required=True,
-    )
-
-    parser.add_argument(
-        "--valid-engine-ids-file",
-        default=None,
-        help=(
-            "Text file containing the fixed 50 validation engine IDs. "
-            "Use this for exact paper reproduction."
-        ),
-    )
-
-    parser.add_argument(
-        "--split-seed",
-        type=int,
-        default=42,
-        help=(
-            "Exploratory fallback only when no fixed validation-ID file "
-            "is supplied."
-        ),
-    )
-
-    parser.add_argument(
-        "--require-paper-split",
-        action="store_true",
-        help=(
-            "Fail unless --valid-engine-ids-file is supplied and the "
-            "window counts match the recorded 23034/5417/18429."
-        ),
-    )
-
-    parser.add_argument(
-        "--centroid-shrinkage-kappa",
-        type=float,
-        default=0.0,
-        help=(
-            "Explicit RB-PCA centroid shrinkage kappa. "
-            "0 disables shrinkage. The historical paper coefficient "
-            "was not preserved, so do not invent one silently."
-        ),
-    )
-
-    parser.add_argument(
-        "--backbone",
-        default="all",
-    )
-
-    parser.add_argument(
-        "--seed",
-        default="all",
-    )
-
-    parser.add_argument(
-        "--representation",
-        choices=[
-            "raw",
-            "quotient",
-            "both",
-        ],
-        default="both",
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=train_config.epochs,
-    )
-
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=train_config.patience,
-    )
-
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=train_config.batch_size,
-    )
-
-    parser.add_argument(
-        "--output",
-        default="results/fd004_results.csv",
-    )
-
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-    )
-
-    args = parser.parse_args()
-
-    valid_engine_ids = None
-
-    if (
-        args.valid_engine_ids_file
-        is not None
+    def fit_transform(
+        self,
+        q,
+        settings,
     ):
-        valid_engine_ids = (
-            read_engine_ids_file(
-                args.valid_engine_ids_file
+        return (
+            self.fit(q, settings)
+            .transform(q, settings)
+        )
+
+    def transform_settings(
+        self,
+        settings,
+    ):
+        if not hasattr(
+            self,
+            "setting_scaler_",
+        ):
+            raise RuntimeError(
+                "Call fit() first."
+            )
+
+        return (
+            self.setting_scaler_
+            .transform(
+                np.asarray(
+                    settings,
+                    dtype=float,
+                )
             )
         )
 
-    elif args.require_paper_split:
-        parser.error(
-            "--require-paper-split requires "
-            "--valid-engine-ids-file."
+
+def read_fd004_txt(path):
+    df = pd.read_csv(
+        Path(path),
+        sep=r"\s+",
+        header=None,
+        names=FD004_COLUMNS,
+        engine="python",
+    )
+
+    if df.shape[1] != 26:
+        raise ValueError(
+            "FD004 file must contain 26 columns."
+        )
+
+    df["engine_id"] = (
+        df["engine_id"].astype(int)
+    )
+
+    df["cycle"] = (
+        df["cycle"].astype(int)
+    )
+
+    return df
+
+
+def read_rul_file(path):
+    return (
+        pd.read_csv(
+            Path(path),
+            sep=r"\s+",
+            header=None,
+            engine="python",
+        )
+        .iloc[:, 0]
+        .to_numpy(dtype=float)
+    )
+
+
+def read_engine_ids_file(path):
+    """
+    Read a fixed validation-engine list.
+
+    Accepted formats include one ID per line or any whitespace-separated
+    collection of integer IDs.
+    """
+    text = Path(path).read_text(
+        encoding="utf-8"
+    )
+
+    ids = np.asarray(
+        [
+            int(token)
+            for token in text.split()
+        ],
+        dtype=int,
+    )
+
+    if len(ids) == 0:
+        raise ValueError(
+            "Engine-ID file is empty."
+        )
+
+    if len(np.unique(ids)) != len(ids):
+        raise ValueError(
+            "Engine-ID file contains duplicates."
+        )
+
+    return np.sort(ids)
+
+
+def add_train_rul(
+    df,
+    cap=125.0,
+):
+    df = df.copy()
+
+    max_cycle = (
+        df.groupby("engine_id")["cycle"]
+        .transform("max")
+    )
+
+    df["rul_true"] = (
+        max_cycle
+        - df["cycle"]
+    )
+
+    df["rul"] = np.minimum(
+        df["rul_true"],
+        float(cap),
+    )
+
+    return df
+
+
+def add_test_rul(
+    df,
+    last_rul,
+    cap=125.0,
+):
+    df = df.copy()
+
+    engines = np.sort(
+        df["engine_id"].unique()
+    )
+
+    last_rul = np.asarray(
+        last_rul,
+        dtype=float,
+    ).reshape(-1)
+
+    if len(engines) != len(last_rul):
+        raise ValueError(
+            "Number of test engines does not match RUL labels."
+        )
+
+    last_rul_map = dict(
+        zip(
+            engines,
+            last_rul,
+        )
+    )
+
+    max_cycle_map = (
+        df.groupby("engine_id")["cycle"]
+        .max()
+        .to_dict()
+    )
+
+    true_rul = np.empty(
+        len(df),
+        dtype=float,
+    )
+
+    for pos, row in enumerate(
+        df[
+            [
+                "engine_id",
+                "cycle",
+            ]
+        ].itertuples(
+            index=False
+        )
+    ):
+        e = int(row.engine_id)
+        t = int(row.cycle)
+
+        true_rul[pos] = (
+            float(last_rul_map[e])
+            + float(
+                max_cycle_map[e] - t
+            )
+        )
+
+    df["rul_true"] = true_rul
+
+    df["rul"] = np.minimum(
+        true_rul,
+        float(cap),
+    )
+
+    return df
+
+
+def split_training_engines(
+    df,
+    n_valid_engines=50,
+    seed=42,
+    valid_engine_ids=None,
+):
+    engines = np.sort(
+        df["engine_id"].unique()
+    )
+
+    if valid_engine_ids is None:
+        rng = np.random.default_rng(
+            int(seed)
+        )
+
+        valid_engine_ids = np.sort(
+            rng.choice(
+                engines,
+                size=int(
+                    n_valid_engines
+                ),
+                replace=False,
+            )
         )
 
     else:
-        warnings.warn(
-            "No fixed validation-engine file was supplied. "
-            "The run will use an exploratory random 199/50 engine split "
-            "and is NOT guaranteed to reproduce the recorded FD004 paper split."
+        valid_engine_ids = np.sort(
+            np.asarray(
+                valid_engine_ids,
+                dtype=int,
+            )
         )
 
-    data_dir = Path(
-        args.data_dir
+        if (
+            len(valid_engine_ids)
+            != int(n_valid_engines)
+        ):
+            raise ValueError(
+                "Expected exactly "
+                f"{n_valid_engines} validation engines, "
+                f"got {len(valid_engine_ids)}."
+            )
+
+        missing = np.setdiff1d(
+            valid_engine_ids,
+            engines,
+        )
+
+        if len(missing):
+            raise ValueError(
+                "Unknown validation engine IDs: "
+                f"{missing.tolist()}"
+            )
+
+    train_engine_ids = np.setdiff1d(
+        engines,
+        valid_engine_ids,
     )
 
-    data = load_fd004(
-        train_path=(
-            data_dir
-            / "train_FD004.txt"
+    return (
+        train_engine_ids,
+        valid_engine_ids,
+    )
+
+
+def _linear_slope(values):
+    values = np.asarray(
+        values,
+        dtype=float,
+    )
+
+    L = len(values)
+
+    if L < 2:
+        return 0.0
+
+    t = np.arange(
+        L,
+        dtype=float,
+    )
+
+    t_centered = (
+        t - t.mean()
+    )
+
+    y_centered = (
+        values
+        - values.mean()
+    )
+
+    denom = np.sum(
+        t_centered ** 2
+    )
+
+    if denom <= 0:
+        return 0.0
+
+    return float(
+        np.sum(
+            t_centered
+            * y_centered
+        )
+        / denom
+    )
+
+
+
+def _window_sensor_features(
+    sensor_matrix,
+):
+    """
+    Vectorized 21-sensor summary:
+        mean, population std, least-squares slope
+    for each sensor, yielding 63 features.
+    """
+    sensor_matrix = np.asarray(
+        sensor_matrix,
+        dtype=float,
+    )
+
+    if (
+        sensor_matrix.ndim != 2
+        or sensor_matrix.shape[1] != 21
+    ):
+        raise ValueError(
+            "sensor_matrix must have shape (L, 21)."
+        )
+
+    L = sensor_matrix.shape[0]
+
+    means = sensor_matrix.mean(
+        axis=0
+    )
+
+    stds = sensor_matrix.std(
+        axis=0,
+        ddof=0,
+    )
+
+    if L < 2:
+        slopes = np.zeros(
+            21,
+            dtype=float,
+        )
+    else:
+        t = np.arange(
+            L,
+            dtype=float,
+        )
+        tc = t - t.mean()
+        denom = np.sum(
+            tc ** 2
+        )
+
+        slopes = (
+            tc @ (
+                sensor_matrix
+                - means[None, :]
+            )
+        ) / denom
+
+    return np.column_stack(
+        [
+            means,
+            stds,
+            slopes,
+        ]
+    ).reshape(-1)
+
+
+def _left_pad_sensor_matrix(
+    sensor_matrix,
+    target_length,
+):
+    sensor_matrix = np.asarray(
+        sensor_matrix,
+        dtype=float,
+    )
+
+    n = len(sensor_matrix)
+
+    if n >= target_length:
+        return sensor_matrix
+
+    pad_n = (
+        target_length - n
+    )
+
+    padding = np.repeat(
+        sensor_matrix[[0]],
+        pad_n,
+        axis=0,
+    )
+
+    return np.vstack(
+        [
+            padding,
+            sensor_matrix,
+        ]
+    )
+
+
+def make_windows(
+    df,
+    window_length=20,
+    stride=2,
+    pad_short_engines=False,
+    force_endpoint=True,
+):
+    """
+    Build engine-wise sliding windows.
+
+    Rules
+    -----
+    * full windows use length 20 and stride 2;
+    * the final observed cycle of every engine is always represented;
+    * for official test engines shorter than 20 cycles, the first
+      observation is repeated on the left until length 20.
+
+    On the standard NASA FD004 test files these rules yield exactly
+    18,429 official-test windows.
+    """
+    window_length = int(
+        window_length
+    )
+    stride = int(
+        stride
+    )
+
+    if window_length < 2:
+        raise ValueError(
+            "window_length must be at least 2."
+        )
+
+    if stride < 1:
+        raise ValueError(
+            "stride must be positive."
+        )
+
+    Y_rows = []
+    q_rows = []
+    settings_rows = []
+    engine_rows = []
+    cycle_rows = []
+
+    for engine_id, g in df.groupby(
+        "engine_id",
+        sort=True,
+    ):
+        g = g.sort_values(
+            "cycle"
+        )
+
+        sensors_all = g[
+            SENSOR_COLUMNS
+        ].to_numpy(
+            dtype=float
+        )
+
+        settings_all = g[
+            SETTING_COLUMNS
+        ].to_numpy(
+            dtype=float
+        )
+
+        q_all = g[
+            "rul"
+        ].to_numpy(
+            dtype=float
+        )
+
+        cycles_all = g[
+            "cycle"
+        ].to_numpy(
+            dtype=int
+        )
+
+        n = len(g)
+
+        # Entire observed trajectory shorter than one full window.
+        if n < window_length:
+            if not pad_short_engines:
+                continue
+
+            padded = _left_pad_sensor_matrix(
+                sensors_all,
+                window_length,
+            )
+
+            Y_rows.append(
+                _window_sensor_features(
+                    padded
+                )
+            )
+
+            q_rows.append(
+                float(q_all[-1])
+            )
+
+            settings_rows.append(
+                settings_all[-1]
+            )
+
+            engine_rows.append(
+                int(engine_id)
+            )
+
+            cycle_rows.append(
+                int(cycles_all[-1])
+            )
+
+            continue
+
+        last_start = (
+            n - window_length
+        )
+
+        starts = list(
+            range(
+                0,
+                last_start + 1,
+                stride,
+            )
+        )
+
+        # With stride 2, the parity of the trajectory length can otherwise
+        # cause the true final observed cycle to be absent from all windows.
+        if (
+            force_endpoint
+            and starts[-1] != last_start
+        ):
+            starts.append(
+                last_start
+            )
+
+        for start in starts:
+            end = (
+                start
+                + window_length
+            )
+
+            window_sensors = (
+                sensors_all[
+                    start:end
+                ]
+            )
+
+            endpoint_idx = (
+                end - 1
+            )
+
+            Y_rows.append(
+                _window_sensor_features(
+                    window_sensors
+                )
+            )
+
+            q_rows.append(
+                float(
+                    q_all[
+                        endpoint_idx
+                    ]
+                )
+            )
+
+            settings_rows.append(
+                settings_all[
+                    endpoint_idx
+                ]
+            )
+
+            engine_rows.append(
+                int(engine_id)
+            )
+
+            cycle_rows.append(
+                int(
+                    cycles_all[
+                        endpoint_idx
+                    ]
+                )
+            )
+
+    if not Y_rows:
+        raise ValueError(
+            "No windows were created."
+        )
+
+    return FD004Partition(
+        Y=np.vstack(
+            Y_rows
         ),
-        test_path=(
-            data_dir
-            / "test_FD004.txt"
+        q=np.asarray(
+            q_rows,
+            dtype=float,
         ),
-        rul_path=(
-            data_dir
-            / "RUL_FD004.txt"
+        settings=np.vstack(
+            settings_rows
         ),
-        n_valid_engines=50,
-        split_seed=(
-            args.split_seed
+        engine_id=np.asarray(
+            engine_rows,
+            dtype=int,
+        ),
+        cycle=np.asarray(
+            cycle_rows,
+            dtype=int,
+        ),
+    )
+
+
+def subset_by_engines(
+    df,
+    engine_ids,
+):
+    engine_ids = np.asarray(
+        engine_ids,
+        dtype=int,
+    )
+
+    return df[
+        df["engine_id"]
+        .isin(engine_ids)
+    ].copy()
+
+
+def load_fd004(
+    train_path,
+    test_path,
+    rul_path,
+    n_valid_engines=50,
+    split_seed=42,
+    valid_engine_ids=None,
+    rul_cap=125.0,
+    window_length=20,
+    stride=2,
+):
+    train_raw = read_fd004_txt(
+        train_path
+    )
+
+    test_raw = read_fd004_txt(
+        test_path
+    )
+
+    last_rul = read_rul_file(
+        rul_path
+    )
+
+    train_raw = add_train_rul(
+        train_raw,
+        cap=rul_cap,
+    )
+
+    test_raw = add_test_rul(
+        test_raw,
+        last_rul=last_rul,
+        cap=rul_cap,
+    )
+
+    (
+        train_engine_ids,
+        valid_engine_ids,
+    ) = split_training_engines(
+        train_raw,
+        n_valid_engines=n_valid_engines,
+        seed=split_seed,
+        valid_engine_ids=(
+            valid_engine_ids
+        ),
+    )
+
+    train_df = subset_by_engines(
+        train_raw,
+        train_engine_ids,
+    )
+
+    valid_df = subset_by_engines(
+        train_raw,
+        valid_engine_ids,
+    )
+
+    train = make_windows(
+        train_df,
+        window_length=window_length,
+        stride=stride,
+        pad_short_engines=False,
+        force_endpoint=True,
+    )
+
+    valid = make_windows(
+        valid_df,
+        window_length=window_length,
+        stride=stride,
+        pad_short_engines=False,
+        force_endpoint=True,
+    )
+
+    test = make_windows(
+        test_raw,
+        window_length=window_length,
+        stride=stride,
+        pad_short_engines=True,
+        force_endpoint=True,
+    )
+
+    return FD004Data(
+        train=train,
+        valid=valid,
+        test=test,
+        train_engine_ids=(
+            train_engine_ids
         ),
         valid_engine_ids=(
             valid_engine_ids
         ),
-        rul_cap=125.0,
-        window_length=20,
-        stride=2,
     )
 
-    summary = describe_fd004(
-        data
+
+def build_fd004_forward_design(
+    data,
+    n_regimes=6,
+    n_knots=5,
+    spline_degree=3,
+    random_state=42,
+):
+    design = FD004ForwardDesign(
+        n_regimes=n_regimes,
+        n_knots=n_knots,
+        spline_degree=(
+            spline_degree
+        ),
+        random_state=(
+            random_state
+        ),
     )
 
-    print(
-        "FD004 data summary:"
-    )
-    print(
-        summary
-    )
-
-    counts_match = all(
-        summary[key]
-        == value
-        for key, value
-        in PAPER_WINDOW_COUNTS.items()
+    X_train = (
+        design.fit_transform(
+            data.train.q,
+            data.train.settings,
+        )
     )
 
-    print(
-        "Recorded paper window counts match:",
-        counts_match,
+    X_valid = (
+        design.transform(
+            data.valid.q,
+            data.valid.settings,
+        )
+    )
+
+    X_test = (
+        design.transform(
+            data.test.q,
+            data.test.settings,
+        )
+    )
+
+    return (
+        design,
+        X_train,
+        X_valid,
+        X_test,
+    )
+
+
+def append_standardized_settings(
+    sensor_representation,
+    settings,
+    design_builder,
+):
+    sensor_representation = (
+        np.asarray(
+            sensor_representation,
+            dtype=float,
+        )
+    )
+
+    settings_z = (
+        design_builder
+        .transform_settings(
+            settings
+        )
     )
 
     if (
-        args.require_paper_split
-        and not counts_match
+        len(sensor_representation)
+        != len(settings_z)
     ):
-        raise RuntimeError(
-            "The supplied validation-engine IDs do not reproduce "
-            "the recorded 23034/5417/18429 window counts."
-        )
-
-    (
-        design,
-        X_forward_train,
-        _,
-        _,
-    ) = build_fd004_forward_design(
-        data,
-        n_regimes=6,
-        n_knots=5,
-        spline_degree=3,
-        random_state=(
-            args.split_seed
-        ),
-    )
-
-    rbpca = ResidualBatchPCA(
-        rank=None,
-        variance_threshold=0.90,
-        ridge_alpha=1.0,
-        crossfit="group_kfold",
-        n_splits=5,
-        random_state=(
-            args.split_seed
-        ),
-        centroid_shrinkage_kappa=(
-            args.centroid_shrinkage_kappa
-        ),
-    )
-
-    rbpca.fit(
-        Y=data.train.Y,
-        X_forward=(
-            X_forward_train
-        ),
-        batch=(
-            data.train.engine_id
-        ),
-    )
-
-    print(
-        "RB-PCA diagnostics:"
-    )
-
-    print(
-        rbpca.diagnostics()
-    )
-
-    reps = {
-        "raw": (
-            rbpca.transform_raw(
-                data.train.Y
-            ),
-            rbpca.transform_raw(
-                data.valid.Y
-            ),
-            rbpca.transform_raw(
-                data.test.Y
-            ),
-        ),
-
-        "quotient": (
-            rbpca.transform(
-                data.train.Y
-            ),
-            rbpca.transform(
-                data.valid.Y
-            ),
-            rbpca.transform(
-                data.test.Y
-            ),
-        ),
-    }
-
-    for name, (
-        Y_train,
-        Y_valid,
-        Y_test,
-    ) in list(
-        reps.items()
-    ):
-        reps[name] = (
-            append_standardized_settings(
-                Y_train,
-                data.train.settings,
-                design,
-            ),
-
-            append_standardized_settings(
-                Y_valid,
-                data.valid.settings,
-                design,
-            ),
-
-            append_standardized_settings(
-                Y_test,
-                data.test.settings,
-                design,
-            ),
-        )
-
-    representation_names = (
-        [
-            "raw",
-            "quotient",
-        ]
-        if args.representation
-        == "both"
-        else [
-            args.representation
-        ]
-    )
-
-    backbones = parse_list_or_all(
-        args.backbone,
-        BACKBONES,
-    )
-
-    unknown = (
-        set(backbones)
-        - set(BACKBONES)
-    )
-
-    if unknown:
         raise ValueError(
-            f"Unknown backbones: {sorted(unknown)}"
+            "Row counts do not match."
         )
 
-    seeds = parse_list_or_all(
-        args.seed,
-        SEEDS,
-        cast=int,
-    )
-
-    if args.smoke:
-        backbones = backbones[:1]
-        seeds = seeds[:1]
-        args.epochs = min(
-            args.epochs,
-            3,
-        )
-        args.patience = min(
-            args.patience,
-            2,
-        )
-
-    configs = configs_for_dataset(
-        "fd004"
-    )
-
-    end_mask = endpoint_mask(
-        data.test.engine_id,
-        data.test.cycle,
-    )
-
-    if int(end_mask.sum()) != 248:
-        raise RuntimeError(
-            "Expected one endpoint window for each of the 248 test engines."
-        )
-
-    for backbone in backbones:
-        for seed in seeds:
-            for representation in representation_names:
-                print(
-                    "\n[FD004]",
-                    f"backbone={backbone}",
-                    f"seed={seed}",
-                    f"representation={representation}",
-                )
-
-                set_seed(
-                    seed
-                )
-
-                (
-                    X_train,
-                    X_valid,
-                    X_test,
-                ) = reps[
-                    representation
-                ]
-
-                if backbone == "xgboost":
-                    model = train_xgboost(
-                        X_train,
-                        data.train.q,
-                        X_valid,
-                        data.valid.q,
-                        config=(
-                            configs[
-                                "xgboost"
-                            ]
-                        ),
-                        seed=seed,
-                        selection_metric=(
-                            "rmse"
-                        ),
-                    )
-
-                    test_metrics = (
-                        evaluate_xgboost(
-                            model,
-                            X_test,
-                            data.test.q,
-                            return_predictions=True,
-                        )
-                    )
-
-                else:
-                    model = (
-                        build_torch_model(
-                            backbone,
-                            configs[
-                                backbone
-                            ],
-                        )
-                    )
-
-                    train_loader = (
-                        make_loader(
-                            X_train,
-                            data.train.q,
-                            args.batch_size,
-                            True,
-                        )
-                    )
-
-                    valid_loader = (
-                        make_loader(
-                            X_valid,
-                            data.valid.q,
-                            args.batch_size,
-                            False,
-                        )
-                    )
-
-                    test_loader = (
-                        make_loader(
-                            X_test,
-                            data.test.q,
-                            args.batch_size,
-                            False,
-                        )
-                    )
-
-                    fit_torch_regressor(
-                        backbone,
-                        model,
-                        train_loader,
-                        valid_loader,
-                        epochs=(
-                            args.epochs
-                        ),
-                        patience=(
-                            args.patience
-                        ),
-                        device=DEVICE,
-                        selection_metric=(
-                            "rmse"
-                        ),
-                    )
-
-                    test_metrics = (
-                        evaluate_torch(
-                            backbone,
-                            model,
-                            test_loader,
-                            device=DEVICE,
-                            return_predictions=True,
-                        )
-                    )
-
-                y_true = np.asarray(
-                    test_metrics[
-                        "y_true"
-                    ]
-                )
-
-                y_pred = np.asarray(
-                    test_metrics[
-                        "y_pred"
-                    ]
-                )
-
-                endpoint_mse = float(
-                    np.mean(
-                        (
-                            y_pred[
-                                end_mask
-                            ]
-                            - y_true[
-                                end_mask
-                            ]
-                        ) ** 2
-                    )
-                )
-
-                endpoint_rmse = float(
-                    np.sqrt(
-                        endpoint_mse
-                    )
-                )
-
-                row = {
-                    "dataset":
-                        "FD004",
-
-                    "backbone":
-                        backbone,
-
-                    "seed":
-                        seed,
-
-                    "representation":
-                        representation,
-
-                    "paper_counts_match":
-                        counts_match,
-
-                    "centroid_shrinkage_kappa":
-                        args.centroid_shrinkage_kappa,
-
-                    "rbpca_rank":
-                        rbpca.selected_rank_,
-
-                    "rbpca_cumvar":
-                        float(
-                            rbpca
-                            .cumulative_explained_variance_[
-                                rbpca.selected_rank_
-                                - 1
-                            ]
-                        ),
-
-                    "test_all_mse":
-                        float(
-                            test_metrics[
-                                "mse"
-                            ]
-                        ),
-
-                    "test_all_rmse":
-                        float(
-                            test_metrics[
-                                "rmse"
-                            ]
-                        ),
-
-                    "test_endpoint_mse":
-                        endpoint_mse,
-
-                    "test_endpoint_rmse":
-                        endpoint_rmse,
-                }
-
-                print(
-                    row
-                )
-
-                save_row(
-                    args.output,
-                    row,
-                )
-
-    print(
-        "\nSaved results to",
-        args.output,
+    return np.column_stack(
+        [
+            sensor_representation,
+            settings_z,
+        ]
     )
 
 
-if __name__ == "__main__":
-    main()
+def describe_fd004(data):
+    return {
+        "train_windows":
+            int(len(data.train.q)),
+
+        "valid_windows":
+            int(len(data.valid.q)),
+
+        "test_windows":
+            int(len(data.test.q)),
+
+        "train_engines":
+            int(
+                len(
+                    np.unique(
+                        data.train.engine_id
+                    )
+                )
+            ),
+
+        "valid_engines":
+            int(
+                len(
+                    np.unique(
+                        data.valid.engine_id
+                    )
+                )
+            ),
+
+        "test_engines":
+            int(
+                len(
+                    np.unique(
+                        data.test.engine_id
+                    )
+                )
+            ),
+
+        "sensor_feature_dim":
+            int(
+                data.train.Y.shape[1]
+            ),
+    }
