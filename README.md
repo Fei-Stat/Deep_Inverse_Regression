@@ -110,8 +110,9 @@ the end.
 
 ### NASA C-MAPSS FD004
 FD004 dataset essentially decribes the remaining useful life (RUL) of commercial turbofan engines developed by NASA. In particular, the included fields are given below:
-| unit / engine_id | cycle | setting_1 | setting_2 | setting_3 | sensor_1 | sensor_2 | sensor_3 | sensor_4 | sensor_5 | sensor_6 | sensor_7 | sensor_8 | sensor_9 | sensor_10 | sensor_11 | sensor_12 | sensor_13 | sensor_14 | sensor_15 | sensor_16 | sensor_17 | sensor_18 | sensor_19 | sensor_20 | sensor_21 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| engine_id | cycle | operating settings | sensor features |
+| --- | --- | --- | --- |
+| `unit / engine_id` | `cycle` | `setting_1` ~ `setting_3` | `sensor_1` ~ `sensor_21` |
 
 where
 1. engine_id: The identification of the studied engine;
@@ -125,10 +126,9 @@ Training_procedure
 
 ### Open Soil Spectral Library
 OSSL dataset is joint table of a variety of data collections to describe soil spectral records and related component contents:
-| source / dataset.code_ascii_txt | sample_id / id.layer_uuid_txt | organic_carbon / oc_usda.c729_w.pct | mir_600 | mir_608 | mir_616 | ... | mir_3984 | mir_3992 | mir_4000 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-
-
+| source | sample_id | target | MIR features |
+| --- | --- | --- | --- |
+| `dataset.code_ascii_txt` | `id.layer_uuid_txt` | `oc_usda.c729_w.pct` | `scan_mir.600_abs` ~ `scan_mir.4000_abs` |
 
 
 
