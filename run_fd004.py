@@ -3,19 +3,26 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import (
+    DataLoader,
+    TensorDataset,
+)
 
 from datasets.fd004 import (
     load_fd004,
+    read_engine_ids_file,
     build_fd004_forward_design,
     append_standardized_settings,
     describe_fd004,
 )
 
-from scripts.ResidualBatchPCA import ResidualBatchPCA
+from scripts.ResidualBatchPCA import (
+    ResidualBatchPCA,
+)
 
 from scripts.config import (
     DEVICE,
@@ -41,10 +48,12 @@ BACKBONES = [
     "xgboost",
 ]
 
+PAPER_WINDOW_COUNTS = {
+    "train_windows": 23034,
+    "valid_windows": 5417,
+    "test_windows": 18429,
+}
 
-# ============================================================
-# DataLoader
-# ============================================================
 
 def make_loader(
     X,
@@ -68,48 +77,46 @@ def make_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=(
+            torch.cuda.is_available()
+        ),
     )
 
-
-# ============================================================
-# Test-engine endpoint mask
-# ============================================================
 
 def endpoint_mask(
     engine_id,
     cycle,
 ):
-    """
-    Select the final observed window for every test engine.
-    """
+    engine_id = np.asarray(
+        engine_id
+    )
 
-    engine_id = np.asarray(engine_id)
-    cycle = np.asarray(cycle)
+    cycle = np.asarray(
+        cycle
+    )
 
     mask = np.zeros(
         len(engine_id),
         dtype=bool,
     )
 
-    for engine in np.unique(engine_id):
-
-        index = np.flatnonzero(
+    for engine in np.unique(
+        engine_id
+    ):
+        idx = np.flatnonzero(
             engine_id == engine
         )
 
-        last_index = index[
-            np.argmax(cycle[index])
+        last = idx[
+            np.argmax(
+                cycle[idx]
+            )
         ]
 
-        mask[last_index] = True
+        mask[last] = True
 
     return mask
 
-
-# ============================================================
-# CLI helpers
-# ============================================================
 
 def parse_list_or_all(
     value,
@@ -121,14 +128,15 @@ def parse_list_or_all(
 
     return [
         cast(item.strip())
-        for item in str(value).split(",")
+        for item
+        in str(value).split(",")
         if item.strip()
     ]
 
 
-def save_rows(
+def save_row(
     path,
-    rows,
+    row,
 ):
     path = Path(path)
 
@@ -137,72 +145,89 @@ def save_rows(
         exist_ok=True,
     )
 
-    if not rows:
-        return
-
-    fieldnames = list(
-        rows[0].keys()
+    write_header = (
+        not path.exists()
     )
-
-    write_header = not path.exists()
 
     with path.open(
         "a",
         newline="",
         encoding="utf-8",
-    ) as file:
-
+    ) as f:
         writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
+            f,
+            fieldnames=list(
+                row.keys()
+            ),
         )
 
         if write_header:
             writer.writeheader()
 
-        writer.writerows(rows)
+        writer.writerow(
+            row
+        )
 
-
-# ============================================================
-# Main
-# ============================================================
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
-            "FD004 raw-versus-quotient "
-            "RUL regression experiment."
+            "C-MAPSS FD004 raw-versus-quotient RUL regression."
         )
     )
 
     parser.add_argument(
         "--data-dir",
         required=True,
+    )
+
+    parser.add_argument(
+        "--valid-engine-ids-file",
+        default=None,
         help=(
-            "Directory containing "
-            "train_FD004.txt, "
-            "test_FD004.txt and "
-            "RUL_FD004.txt."
+            "Text file containing the fixed 50 validation engine IDs. "
+            "Use this for exact paper reproduction."
+        ),
+    )
+
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help=(
+            "Exploratory fallback only when no fixed validation-ID file "
+            "is supplied."
+        ),
+    )
+
+    parser.add_argument(
+        "--require-paper-split",
+        action="store_true",
+        help=(
+            "Fail unless --valid-engine-ids-file is supplied and the "
+            "window counts match the recorded 23034/5417/18429."
+        ),
+    )
+
+    parser.add_argument(
+        "--centroid-shrinkage-kappa",
+        type=float,
+        default=0.0,
+        help=(
+            "Explicit RB-PCA centroid shrinkage kappa. "
+            "0 disables shrinkage. The historical paper coefficient "
+            "was not preserved, so do not invent one silently."
         ),
     )
 
     parser.add_argument(
         "--backbone",
         default="all",
-        help=(
-            "resnet, ft_transformer, "
-            "tabm, xgboost, or all."
-        ),
     )
 
     parser.add_argument(
         "--seed",
         default="all",
-        help=(
-            "Single seed, comma-separated "
-            "seeds, or all."
-        ),
     )
 
     parser.add_argument(
@@ -213,12 +238,6 @@ def main():
             "both",
         ],
         default="both",
-    )
-
-    parser.add_argument(
-        "--split-seed",
-        type=int,
-        default=42,
     )
 
     parser.add_argument(
@@ -247,18 +266,34 @@ def main():
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help=(
-            "Quick pipeline test: "
-            "one backbone, one seed, "
-            "at most three epochs."
-        ),
     )
 
     args = parser.parse_args()
 
-    # ========================================================
-    # 1. Load FD004
-    # ========================================================
+    valid_engine_ids = None
+
+    if (
+        args.valid_engine_ids_file
+        is not None
+    ):
+        valid_engine_ids = (
+            read_engine_ids_file(
+                args.valid_engine_ids_file
+            )
+        )
+
+    elif args.require_paper_split:
+        parser.error(
+            "--require-paper-split requires "
+            "--valid-engine-ids-file."
+        )
+
+    else:
+        warnings.warn(
+            "No fixed validation-engine file was supplied. "
+            "The run will use an exploratory random 199/50 engine split "
+            "and is NOT guaranteed to reproduce the recorded FD004 paper split."
+        )
 
     data_dir = Path(
         args.data_dir
@@ -278,46 +313,63 @@ def main():
             / "RUL_FD004.txt"
         ),
         n_valid_engines=50,
-        split_seed=args.split_seed,
+        split_seed=(
+            args.split_seed
+        ),
+        valid_engine_ids=(
+            valid_engine_ids
+        ),
         rul_cap=125.0,
         window_length=20,
         stride=2,
+    )
+
+    summary = describe_fd004(
+        data
     )
 
     print(
         "FD004 data summary:"
     )
     print(
-        describe_fd004(data)
+        summary
     )
 
-    # ========================================================
-    # 2. Construct forward regression design
-    #
-    # spline(RUL)
-    # + settings
-    # + operating regimes
-    # + spline(RUL) x regime
-    # ========================================================
+    counts_match = all(
+        summary[key]
+        == value
+        for key, value
+        in PAPER_WINDOW_COUNTS.items()
+    )
+
+    print(
+        "Recorded paper window counts match:",
+        counts_match,
+    )
+
+    if (
+        args.require_paper_split
+        and not counts_match
+    ):
+        raise RuntimeError(
+            "The supplied validation-engine IDs do not reproduce "
+            "the recorded 23034/5417/18429 window counts."
+        )
 
     (
         design,
         X_forward_train,
-        X_forward_valid,
-        X_forward_test,
+        _,
+        _,
     ) = build_fd004_forward_design(
         data,
         n_regimes=6,
         n_knots=5,
         spline_degree=3,
-        random_state=args.split_seed,
+        random_state=(
+            args.split_seed
+        ),
     )
-
-    # ========================================================
-    # 3. Residual Batch PCA
-    #
-    # batch = engine_id
-    # ========================================================
 
     rbpca = ResidualBatchPCA(
         rank=None,
@@ -325,30 +377,33 @@ def main():
         ridge_alpha=1.0,
         crossfit="group_kfold",
         n_splits=5,
-        random_state=args.split_seed,
+        random_state=(
+            args.split_seed
+        ),
+        centroid_shrinkage_kappa=(
+            args.centroid_shrinkage_kappa
+        ),
     )
 
     rbpca.fit(
         Y=data.train.Y,
-        X_forward=X_forward_train,
-        batch=data.train.engine_id,
+        X_forward=(
+            X_forward_train
+        ),
+        batch=(
+            data.train.engine_id
+        ),
     )
 
     print(
-        "Residual Batch PCA diagnostics:"
+        "RB-PCA diagnostics:"
     )
+
     print(
         rbpca.diagnostics()
     )
 
-    # ========================================================
-    # 4. Construct raw and quotient representations
-    #
-    # RB-PCA only acts on the 63 sensor features.
-    # Settings are added back afterwards.
-    # ========================================================
-
-    representations = {
+    reps = {
         "raw": (
             rbpca.transform_raw(
                 data.train.Y
@@ -374,20 +429,14 @@ def main():
         ),
     }
 
-    # Append standardized operating settings.
-    #
-    # 63 sensor features + 3 settings = 66 dimensions.
-
     for name, (
         Y_train,
         Y_valid,
         Y_test,
     ) in list(
-        representations.items()
+        reps.items()
     ):
-
-        representations[name] = (
-
+        reps[name] = (
             append_standardized_settings(
                 Y_train,
                 data.train.settings,
@@ -407,42 +456,32 @@ def main():
             ),
         )
 
-    # ========================================================
-    # 5. Choose representations
-    # ========================================================
-
-    if args.representation == "both":
-        representation_names = [
+    representation_names = (
+        [
             "raw",
             "quotient",
         ]
-    else:
-        representation_names = [
+        if args.representation
+        == "both"
+        else [
             args.representation
         ]
-
-    # ========================================================
-    # 6. Choose backbones
-    # ========================================================
+    )
 
     backbones = parse_list_or_all(
         args.backbone,
         BACKBONES,
     )
 
-    unknown = sorted(
+    unknown = (
         set(backbones)
         - set(BACKBONES)
     )
 
     if unknown:
         raise ValueError(
-            f"Unknown backbones: {unknown}"
+            f"Unknown backbones: {sorted(unknown)}"
         )
-
-    # ========================================================
-    # 7. Choose seeds
-    # ========================================================
 
     seeds = parse_list_or_all(
         args.seed,
@@ -450,81 +489,69 @@ def main():
         cast=int,
     )
 
-    # Smoke test
     if args.smoke:
-
         backbones = backbones[:1]
         seeds = seeds[:1]
-
         args.epochs = min(
             args.epochs,
             3,
         )
-
         args.patience = min(
             args.patience,
             2,
         )
 
-    # ========================================================
-    # 8. Backbone configurations
-    # ========================================================
-
     configs = configs_for_dataset(
         "fd004"
     )
 
-    # Test endpoint for each engine
     end_mask = endpoint_mask(
         data.test.engine_id,
         data.test.cycle,
     )
 
-    # ========================================================
-    # 9. Run experiments
-    # ========================================================
-
-    rows = []
+    if int(end_mask.sum()) != 248:
+        raise RuntimeError(
+            "Expected one endpoint window for each of the 248 test engines."
+        )
 
     for backbone in backbones:
-
         for seed in seeds:
-
             for representation in representation_names:
-
-                print()
                 print(
-                    "[FD004] "
-                    f"backbone={backbone} "
-                    f"seed={seed} "
-                    f"representation={representation}"
+                    "\n[FD004]",
+                    f"backbone={backbone}",
+                    f"seed={seed}",
+                    f"representation={representation}",
                 )
 
-                set_seed(seed)
+                set_seed(
+                    seed
+                )
 
                 (
                     X_train,
                     X_valid,
                     X_test,
-                ) = representations[
+                ) = reps[
                     representation
                 ]
 
-                # ============================================
-                # XGBoost
-                # ============================================
-
                 if backbone == "xgboost":
-
                     model = train_xgboost(
                         X_train,
                         data.train.q,
                         X_valid,
                         data.valid.q,
-                        config=configs[
-                            "xgboost"
-                        ],
+                        config=(
+                            configs[
+                                "xgboost"
+                            ]
+                        ),
                         seed=seed,
+                        selection_metric=(
+                            "rmse"
+                        ),
                     )
 
                     test_metrics = (
@@ -536,15 +563,14 @@ def main():
                         )
                     )
 
-                # ============================================
-                # Neural backbones
-                # ============================================
-
                 else:
-
-                    model = build_torch_model(
-                        backbone,
-                        configs[backbone],
+                    model = (
+                        build_torch_model(
+                            backbone,
+                            configs[
+                                backbone
+                            ],
+                        )
                     )
 
                     train_loader = (
@@ -579,9 +605,16 @@ def main():
                         model,
                         train_loader,
                         valid_loader,
-                        epochs=args.epochs,
-                        patience=args.patience,
+                        epochs=(
+                            args.epochs
+                        ),
+                        patience=(
+                            args.patience
+                        ),
                         device=DEVICE,
+                        selection_metric=(
+                            "rmse"
+                        ),
                     )
 
                     test_metrics = (
@@ -594,25 +627,28 @@ def main():
                         )
                     )
 
-                # ============================================
-                # Test metrics
-                # ============================================
-
                 y_true = np.asarray(
-                    test_metrics["y_true"]
+                    test_metrics[
+                        "y_true"
+                    ]
                 )
 
                 y_pred = np.asarray(
-                    test_metrics["y_pred"]
+                    test_metrics[
+                        "y_pred"
+                    ]
                 )
 
                 endpoint_mse = float(
                     np.mean(
                         (
-                            y_pred[end_mask]
-                            - y_true[end_mask]
-                        )
-                        ** 2
+                            y_pred[
+                                end_mask
+                            ]
+                            - y_true[
+                                end_mask
+                            ]
+                        ) ** 2
                     )
                 )
 
@@ -635,6 +671,12 @@ def main():
                     "representation":
                         representation,
 
+                    "paper_counts_match":
+                        counts_match,
+
+                    "centroid_shrinkage_kappa":
+                        args.centroid_shrinkage_kappa,
+
                     "rbpca_rank":
                         rbpca.selected_rank_,
 
@@ -649,12 +691,16 @@ def main():
 
                     "test_all_mse":
                         float(
-                            test_metrics["mse"]
+                            test_metrics[
+                                "mse"
+                            ]
                         ),
 
                     "test_all_rmse":
                         float(
-                            test_metrics["rmse"]
+                            test_metrics[
+                                "rmse"
+                            ]
                         ),
 
                     "test_endpoint_mse":
@@ -664,18 +710,18 @@ def main():
                         endpoint_rmse,
                 }
 
-                print(row)
-
-                rows.append(row)
-
-                save_rows(
-                    args.output,
-                    [row],
+                print(
+                    row
                 )
 
-    print()
+                save_row(
+                    args.output,
+                    row,
+                )
+
     print(
-        f"Saved results to {args.output}"
+        "\nSaved results to",
+        args.output,
     )
 
 
