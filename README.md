@@ -130,6 +130,12 @@ OSSL dataset is joint table of a variety of data collections to describe soil sp
 | --- | --- | --- | --- |
 | `dataset.code_ascii_txt` | `id.layer_uuid_txt` | `oc_usda.c729_w.pct` | `scan_mir.600_abs` ~ `scan_mir.4000_abs` |
 
+where
+1. source: The unjoint dataset of origin (not important);
+2. sample_id: The identification of the studied sample;
+3. target: The response variable, proportion of organic carbon;
+4. MIR features: The predictors, MIR data.
+
 
 
 
