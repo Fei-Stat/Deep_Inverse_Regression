@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import torch
-
 from torch.utils.data import (
     DataLoader,
     TensorDataset,
-    WeightedRandomSampler,
 )
 
 from datasets.ossl import (
@@ -30,6 +29,8 @@ from scripts.config import (
     SEEDS,
     train_config,
     configs_for_dataset,
+    OSSL_TABM_LR_GRID,
+    OSSL_TABM_SEARCH_EPOCHS,
 )
 
 from scripts.training_utils import (
@@ -50,10 +51,6 @@ BACKBONES = [
 ]
 
 
-# ============================================================
-# DataLoader
-# ============================================================
-
 def make_loader(
     X,
     y,
@@ -61,8 +58,7 @@ def make_loader(
     shuffle,
     sample_weight=None,
 ):
-
-    dataset = TensorDataset(
+    tensors = [
         torch.as_tensor(
             X,
             dtype=torch.float32,
@@ -71,45 +67,30 @@ def make_loader(
             y,
             dtype=torch.float32,
         ),
-    )
+    ]
 
     if sample_weight is not None:
-
-        sampler = WeightedRandomSampler(
-            weights=torch.as_tensor(
+        tensors.append(
+            torch.as_tensor(
                 sample_weight,
-                dtype=torch.double,
-            ),
-            num_samples=len(
-                sample_weight
-            ),
-            replacement=True,
+                dtype=torch.float32,
+            )
         )
 
-        shuffle = False
-
-    else:
-        sampler = None
+    dataset = TensorDataset(
+        *tensors
+    )
 
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=(
-            shuffle
-            if sampler is None
-            else False
-        ),
-        sampler=sampler,
+        shuffle=shuffle,
         num_workers=0,
         pin_memory=(
             torch.cuda.is_available()
         ),
     )
 
-
-# ============================================================
-# Helpers
-# ============================================================
 
 def parse_list_or_all(
     value,
@@ -121,27 +102,21 @@ def parse_list_or_all(
 
     return [
         cast(item.strip())
-        for item in str(value).split(",")
+        for item
+        in str(value).split(",")
         if item.strip()
     ]
 
 
-def save_rows(
+def save_row(
     path,
-    rows,
+    row,
 ):
     path = Path(path)
 
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
-    )
-
-    if not rows:
-        return
-
-    fieldnames = list(
-        rows[0].keys()
     )
 
     write_header = (
@@ -152,64 +127,121 @@ def save_rows(
         "a",
         newline="",
         encoding="utf-8",
-    ) as file:
-
+    ) as f:
         writer = csv.DictWriter(
-            file,
-            fieldnames=fieldnames,
+            f,
+            fieldnames=list(
+                row.keys()
+            ),
         )
 
         if write_header:
             writer.writeheader()
 
-        writer.writerows(rows)
+        writer.writerow(
+            row
+        )
 
 
-# ============================================================
-# Main
-# ============================================================
+def train_torch_once(
+    backbone,
+    config,
+    seed,
+    X_train,
+    y_train,
+    train_weight,
+    X_valid,
+    y_valid,
+    valid_source,
+    batch_size,
+    epochs,
+    patience,
+):
+    # Reset the same seed for every candidate so that LR comparisons are
+    # not confounded by different random initializations.
+    set_seed(
+        seed
+    )
+
+    model = build_torch_model(
+        backbone,
+        config,
+    )
+
+    train_loader = make_loader(
+        X_train,
+        y_train,
+        batch_size,
+        shuffle=True,
+        sample_weight=(
+            train_weight
+        ),
+    )
+
+    valid_loader = make_loader(
+        X_valid,
+        y_valid,
+        batch_size,
+        shuffle=False,
+    )
+
+    fit_torch_regressor(
+        backbone,
+        model,
+        train_loader,
+        valid_loader,
+        epochs=epochs,
+        patience=patience,
+        device=DEVICE,
+        selection_metric=(
+            "macro_mse"
+        ),
+        valid_groups=(
+            valid_source
+        ),
+    )
+
+    valid_metrics = evaluate_torch(
+        backbone,
+        model,
+        valid_loader,
+        device=DEVICE,
+        groups=(
+            valid_source
+        ),
+        return_predictions=False,
+    )
+
+    return (
+        model,
+        valid_metrics,
+    )
+
 
 def main():
-
     parser = argparse.ArgumentParser(
         description=(
-            "OSSL MIR organic-carbon "
-            "raw-versus-quotient regression."
+            "OSSL MIR organic-carbon raw-versus-quotient regression."
         )
     )
 
-    # Either use all-L1
-    # or MIR-L0 + soil-lab-L1.
-
     source_group = (
-        parser.add_mutually_exclusive_group(
+        parser
+        .add_mutually_exclusive_group(
             required=True
         )
     )
 
     source_group.add_argument(
         "--all-l1",
-        help=(
-            "Path to "
-            "ossl_all_L1_v1.2.csv.gz"
-        ),
     )
 
     source_group.add_argument(
         "--mir-l0",
-        help=(
-            "Path to "
-            "ossl_mir_L0_v1.2.csv.gz"
-        ),
     )
 
     parser.add_argument(
         "--soillab-l1",
-        help=(
-            "Path to "
-            "ossl_soillab_L1_v1.2.csv.gz. "
-            "Required when --mir-l0 is used."
-        ),
     )
 
     parser.add_argument(
@@ -235,24 +267,32 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=train_config.epochs,
+        default=(
+            train_config.epochs
+        ),
     )
 
     parser.add_argument(
         "--patience",
         type=int,
-        default=train_config.patience,
+        default=(
+            train_config.patience
+        ),
     )
 
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=train_config.batch_size,
+        default=(
+            train_config.batch_size
+        ),
     )
 
     parser.add_argument(
         "--output",
-        default="results/ossl_results.csv",
+        default=(
+            "results/ossl_results.csv"
+        ),
     )
 
     parser.add_argument(
@@ -267,17 +307,16 @@ def main():
         and args.soillab_l1 is None
     ):
         parser.error(
-            "--soillab-l1 is required "
-            "when --mir-l0 is used."
+            "--soillab-l1 is required when --mir-l0 is used."
         )
 
-    # ========================================================
-    # 1. Load OSSL
-    # ========================================================
-
     data = load_ossl(
-        all_l1_path=args.all_l1,
-        mir_l0_path=args.mir_l0,
+        all_l1_path=(
+            args.all_l1
+        ),
+        mir_l0_path=(
+            args.mir_l0
+        ),
         soillab_l1_path=(
             args.soillab_l1
         ),
@@ -291,24 +330,16 @@ def main():
         describe_ossl(data)
     )
 
-    # ========================================================
-    # 2. Organic-carbon forward spline
-    # ========================================================
-
     (
-        design,
+        _,
         X_forward_train,
-        X_forward_valid,
-        X_forward_test,
+        _,
+        _,
     ) = build_ossl_forward_design(
         data,
         n_knots=7,
         degree=3,
     )
-
-    # ========================================================
-    # 3. Equal-source weights
-    # ========================================================
 
     source_weights = (
         make_equal_source_weights(
@@ -316,40 +347,36 @@ def main():
         )
     )
 
-    # ========================================================
-    # 4. Residual Batch PCA
-    #
-    # batch = source/laboratory
-    # ========================================================
-
     rbpca = ResidualBatchPCA(
         rank=None,
         variance_threshold=0.90,
         ridge_alpha=1.0,
         crossfit="none",
+        centroid_shrinkage_kappa=0.0,
     )
 
     rbpca.fit(
         Y=data.train.Y,
-        X_forward=X_forward_train,
-        batch=data.train.source,
-        sample_weight=source_weights,
+        X_forward=(
+            X_forward_train
+        ),
+        batch=(
+            data.train.source
+        ),
+        sample_weight=(
+            source_weights
+        ),
     )
 
     print(
-        "Residual Batch PCA diagnostics:"
+        "RB-PCA diagnostics:"
     )
 
     print(
         rbpca.diagnostics()
     )
 
-    # ========================================================
-    # 5. Raw / quotient in ORIGINAL 426D MIR space
-    # ========================================================
-
-    representations_426 = {
-
+    reps_426 = {
         "raw": (
             rbpca.transform_raw(
                 data.train.Y
@@ -375,67 +402,44 @@ def main():
         ),
     }
 
-    # ========================================================
-    # 6. Deterministic pooling
-    #
-    # IMPORTANT:
-    # quotient happens BEFORE pooling.
-    #
-    # 426 -> 71
-    # ========================================================
-
-    representations = {}
-
-    for name, values in (
-        representations_426.items()
-    ):
-
-        representations[name] = tuple(
+    # Projection first, deterministic pooling second.
+    reps = {
+        name: tuple(
             mean_pool_mir_426_to_71(
                 X
             )
             for X in values
         )
+        for name, values
+        in reps_426.items()
+    }
 
-    # ========================================================
-    # 7. Representation choices
-    # ========================================================
-
-    if args.representation == "both":
-
-        representation_names = [
+    representation_names = (
+        [
             "raw",
             "quotient",
         ]
-
-    else:
-
-        representation_names = [
+        if args.representation
+        == "both"
+        else [
             args.representation
         ]
-
-    # ========================================================
-    # 8. Backbones
-    # ========================================================
+    )
 
     backbones = parse_list_or_all(
         args.backbone,
         BACKBONES,
     )
 
-    unknown = sorted(
+    unknown = (
         set(backbones)
         - set(BACKBONES)
     )
 
     if unknown:
         raise ValueError(
-            f"Unknown backbones: {unknown}"
+            f"Unknown backbones: {sorted(unknown)}"
         )
-
-    # ========================================================
-    # 9. Seeds
-    # ========================================================
 
     seeds = parse_list_or_all(
         args.seed,
@@ -444,77 +448,89 @@ def main():
     )
 
     if args.smoke:
-
         backbones = backbones[:1]
         seeds = seeds[:1]
-
         args.epochs = min(
             args.epochs,
             3,
         )
-
         args.patience = min(
             args.patience,
             2,
         )
 
-    # ========================================================
-    # 10. Model configs
-    # ========================================================
-
     configs = configs_for_dataset(
         "ossl"
     )
 
-    # ========================================================
-    # 11. Experiments
-    # ========================================================
-
     for backbone in backbones:
-
         for seed in seeds:
-
-            for representation in (
-                representation_names
-            ):
-
-                print()
-
+            for representation in representation_names:
                 print(
-                    "[OSSL] "
-                    f"backbone={backbone} "
-                    f"seed={seed} "
-                    f"representation={representation}"
+                    "\n[OSSL]",
+                    f"backbone={backbone}",
+                    f"seed={seed}",
+                    f"representation={representation}",
                 )
-
-                set_seed(seed)
 
                 (
                     X_train,
                     X_valid,
                     X_test,
-                ) = representations[
+                ) = reps[
                     representation
                 ]
 
-                # ============================================
-                # XGBoost
-                # ============================================
+                selected_lr = None
+                valid_macro_mse = None
 
+                # --------------------------------------------------
+                # XGBoost:
+                # custom equal-source validation macro-MSE controls
+                # early stopping.
+                # --------------------------------------------------
                 if backbone == "xgboost":
+                    set_seed(
+                        seed
+                    )
 
                     model = train_xgboost(
                         X_train,
                         data.train.q,
                         X_valid,
                         data.valid.q,
-                        config=configs[
-                            "xgboost"
-                        ],
+                        config=(
+                            configs[
+                                "xgboost"
+                            ]
+                        ),
                         seed=seed,
                         sample_weight=(
                             source_weights
                         ),
+                        valid_groups=(
+                            data.valid.source
+                        ),
+                        selection_metric=(
+                            "macro_mse"
+                        ),
+                    )
+
+                    valid_metrics = (
+                        evaluate_xgboost(
+                            model,
+                            X_valid,
+                            data.valid.q,
+                            groups=(
+                                data.valid.source
+                            ),
+                        )
+                    )
+
+                    valid_macro_mse = float(
+                        valid_metrics[
+                            "macro_mse"
+                        ]
                     )
 
                     test_metrics = (
@@ -523,37 +539,120 @@ def main():
                             X_test,
                             data.test.q,
                             return_predictions=True,
-                        )
-                    )
-
-                # ============================================
-                # Neural backbones
-                # ============================================
-
-                else:
-
-                    # Weighted sampling ensures that large
-                    # sources do not dominate training.
-
-                    train_loader = (
-                        make_loader(
-                            X_train,
-                            data.train.q,
-                            args.batch_size,
-                            shuffle=False,
-                            sample_weight=(
-                                source_weights
+                            groups=(
+                                data.test.source
                             ),
                         )
                     )
 
-                    valid_loader = (
-                        make_loader(
-                            X_valid,
-                            data.valid.q,
-                            args.batch_size,
-                            shuffle=False,
+                # --------------------------------------------------
+                # TabM:
+                # identical LR grid for raw and quotient.
+                # Every candidate gets 60 epochs in the formal run.
+                # Checkpoint selection uses validation macro-MSE.
+                # --------------------------------------------------
+                elif backbone == "tabm":
+                    lr_grid = list(
+                        OSSL_TABM_LR_GRID
+                    )
+
+                    search_epochs = (
+                        OSSL_TABM_SEARCH_EPOCHS
+                    )
+
+                    search_patience = None
+
+                    if args.smoke:
+                        lr_grid = (
+                            lr_grid[:1]
                         )
+                        search_epochs = min(
+                            3,
+                            search_epochs,
+                        )
+
+                    best_value = float(
+                        "inf"
+                    )
+
+                    best_model = None
+                    best_lr = None
+
+                    for lr in lr_grid:
+                        print(
+                            "  TabM candidate lr=",
+                            lr,
+                        )
+
+                        candidate_config = (
+                            replace(
+                                configs[
+                                    "tabm"
+                                ],
+                                lr=float(lr),
+                            )
+                        )
+
+                        (
+                            candidate_model,
+                            candidate_valid,
+                        ) = train_torch_once(
+                            backbone="tabm",
+                            config=(
+                                candidate_config
+                            ),
+                            seed=seed,
+                            X_train=X_train,
+                            y_train=(
+                                data.train.q
+                            ),
+                            train_weight=(
+                                source_weights
+                            ),
+                            X_valid=X_valid,
+                            y_valid=(
+                                data.valid.q
+                            ),
+                            valid_source=(
+                                data.valid.source
+                            ),
+                            batch_size=(
+                                args.batch_size
+                            ),
+                            epochs=(
+                                search_epochs
+                            ),
+                            patience=(
+                                search_patience
+                            ),
+                        )
+
+                        value = float(
+                            candidate_valid[
+                                "macro_mse"
+                            ]
+                        )
+
+                        print(
+                            "    valid macro-MSE =",
+                            value,
+                        )
+
+                        if value < best_value:
+                            best_value = value
+                            best_model = (
+                                candidate_model
+                            )
+                            best_lr = float(
+                                lr
+                            )
+
+                    model = best_model
+                    selected_lr = (
+                        best_lr
+                    )
+                    valid_macro_mse = (
+                        best_value
                     )
 
                     test_loader = (
@@ -565,23 +664,80 @@ def main():
                         )
                     )
 
-                    model = (
-                        build_torch_model(
-                            backbone,
-                            configs[
-                                backbone
-                            ],
+                    test_metrics = (
+                        evaluate_torch(
+                            "tabm",
+                            model,
+                            test_loader,
+                            device=DEVICE,
+                            return_predictions=True,
+                            groups=(
+                                data.test.source
+                            ),
                         )
                     )
 
-                    fit_torch_regressor(
-                        backbone,
+                # --------------------------------------------------
+                # ResNet / FT-Transformer:
+                # validation checkpoint selected by equal-source
+                # macro-MSE.
+                # --------------------------------------------------
+                else:
+                    (
                         model,
-                        train_loader,
-                        valid_loader,
-                        epochs=args.epochs,
-                        patience=args.patience,
-                        device=DEVICE,
+                        valid_metrics,
+                    ) = train_torch_once(
+                        backbone=backbone,
+                        config=(
+                            configs[
+                                backbone
+                            ]
+                        ),
+                        seed=seed,
+                        X_train=X_train,
+                        y_train=(
+                            data.train.q
+                        ),
+                        train_weight=(
+                            source_weights
+                        ),
+                        X_valid=X_valid,
+                        y_valid=(
+                            data.valid.q
+                        ),
+                        valid_source=(
+                            data.valid.source
+                        ),
+                        batch_size=(
+                            args.batch_size
+                        ),
+                        epochs=(
+                            args.epochs
+                        ),
+                        patience=(
+                            args.patience
+                        ),
+                    )
+
+                    selected_lr = float(
+                        configs[
+                            backbone
+                        ].lr
+                    )
+
+                    valid_macro_mse = float(
+                        valid_metrics[
+                            "macro_mse"
+                        ]
+                    )
+
+                    test_loader = (
+                        make_loader(
+                            X_test,
+                            data.test.q,
+                            args.batch_size,
+                            shuffle=False,
+                        )
                     )
 
                     test_metrics = (
@@ -591,15 +747,13 @@ def main():
                             test_loader,
                             device=DEVICE,
                             return_predictions=True,
+                            groups=(
+                                data.test.source
+                            ),
                         )
                     )
 
-                # ============================================
-                # Save results
-                # ============================================
-
                 row = {
-
                     "dataset":
                         "OSSL_OC",
 
@@ -611,6 +765,12 @@ def main():
 
                     "representation":
                         representation,
+
+                    "selected_lr":
+                        selected_lr,
+
+                    "valid_macro_mse":
+                        valid_macro_mse,
 
                     "rbpca_rank":
                         rbpca.selected_rank_,
@@ -626,31 +786,38 @@ def main():
 
                     "test_mse":
                         float(
-                            test_metrics["mse"]
+                            test_metrics[
+                                "mse"
+                            ]
                         ),
 
                     "test_rmse":
                         float(
-                            test_metrics["rmse"]
+                            test_metrics[
+                                "rmse"
+                            ]
                         ),
 
                     "test_mae":
                         float(
-                            test_metrics["mae"]
+                            test_metrics[
+                                "mae"
+                            ]
                         ),
                 }
 
-                print(row)
-
-                save_rows(
-                    args.output,
-                    [row],
+                print(
+                    row
                 )
 
-    print()
+                save_row(
+                    args.output,
+                    row,
+                )
 
     print(
-        f"Saved results to {args.output}"
+        "\nSaved results to",
+        args.output,
     )
 
 
