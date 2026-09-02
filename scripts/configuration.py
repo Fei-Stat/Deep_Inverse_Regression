@@ -11,14 +11,20 @@ def get_device() -> str:
 
 DEVICE = get_device()
 
-# Fixed seeds used by both FD004 and OSSL paired experiments.
 SEEDS = [7523, 4996, 4292, 4494, 365]
 
-# Dataset-specific downstream dimensions.
-# FD004: 63 sensor-window features + 3 operating settings = 66.
-# OSSL: 426 MIR ordinates -> quotient first -> mean pooling -> 71.
 FD004_INPUT_DIM = 66
 OSSL_INPUT_DIM = 71
+
+# Formal OSSL TabM search protocol recorded for the paper experiment.
+OSSL_TABM_LR_GRID = [
+    1e-4,
+    3e-4,
+    1e-3,
+    3e-3,
+    1e-2,
+]
+OSSL_TABM_SEARCH_EPOCHS = 60
 
 
 @dataclass
@@ -108,7 +114,6 @@ xgb_config = XGBoostConfig()
 
 def configs_for_input_dim(input_dim: int):
     input_dim = int(input_dim)
-
     if input_dim < 1:
         raise ValueError("input_dim must be positive.")
 
@@ -130,10 +135,3 @@ def configs_for_dataset(dataset: str):
         return configs_for_input_dim(OSSL_INPUT_DIM)
 
     raise ValueError(f"Unknown dataset: {dataset}")
-
-
-if __name__ == "__main__":
-    print("DEVICE:", DEVICE)
-    print("SEEDS:", SEEDS)
-    print("FD004 configs:", configs_for_dataset("fd004"))
-    print("OSSL configs:", configs_for_dataset("ossl"))
