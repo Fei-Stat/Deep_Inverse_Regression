@@ -136,10 +136,4 @@ where
 3. target: The response variable, proportion of organic carbon;
 4. MIR features: The predictors, MIR data.
 
-### Pipeline 1: Extracting Nuisance Parameter
-
-
-
-
-
-## Inverse Task 1. UCI Gas Sensor Dataset
+### Pipeline 1: Extracting Nuisance Parameters
