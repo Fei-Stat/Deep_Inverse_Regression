@@ -124,6 +124,9 @@ Training_procedure
 
 
 ### Open Soil Spectral Library
+OSSL dataset is joint table of a variety of data collections to describe soil spectral records and related component contents:
+| source / dataset.code_ascii_txt | sample_id / id.layer_uuid_txt | organic_carbon / oc_usda.c729_w.pct | mir_600 | mir_608 | mir_616 | ... | mir_3984 | mir_3992 | mir_4000 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 
 
 
